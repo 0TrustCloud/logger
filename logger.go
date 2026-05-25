@@ -17,6 +17,9 @@ type LogItem struct {
 	Level     string `json:"level"`
 	Message   string `json:"message"`
 	Service   string `json:"service"`
+	// Audit metadata fields
+	Actor  string `json:"actor,omitempty"`
+	Action string `json:"action,omitempty"`
 }
 
 // RPCLogger provides an asynchronous logging client that falls back to a local WAL.
@@ -34,7 +37,6 @@ type RPCLogger struct {
 func NewRPCLogger(rpc *secure_network.RPCManager, serviceName string, bufferSize int, walPath string) (*RPCLogger, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 
-	// Initialize the local WAL for offline buffering
 	wal, err := ultimate_db.NewBatchingWAL(walPath)
 	if err != nil {
 		cancel()
@@ -58,33 +60,38 @@ func NewRPCLogger(rpc *secure_network.RPCManager, serviceName string, bufferSize
 
 // Info logs an informational message asynchronously.
 func (l *RPCLogger) Info(message string) {
-	l.SendAsync("INFO", message)
+	l.send(LogItem{Level: "INFO", Message: message})
 }
 
 // Error logs an error message asynchronously.
 func (l *RPCLogger) Error(message string) {
-	l.SendAsync("ERROR", message)
+	l.send(LogItem{Level: "ERROR", Message: message})
 }
 
 // Debug logs a debug message asynchronously.
 func (l *RPCLogger) Debug(message string) {
-	l.SendAsync("DEBUG", message)
+	l.send(LogItem{Level: "DEBUG", Message: message})
 }
 
-// SendAsync queues a log entry, falling back to disk if the channel is congested.
-func (l *RPCLogger) SendAsync(level, message string) {
-	item := LogItem{
-		Timestamp: time.Now().UnixNano(),
-		Level:     level,
-		Message:   message,
-		Service:   l.serviceName,
-	}
+// Audit logs a security-sensitive action.
+func (l *RPCLogger) Audit(actor, action, message string) {
+	l.send(LogItem{
+		Level:   "AUDIT",
+		Actor:   actor,
+		Action:  action,
+		Message: message,
+	})
+}
+
+// send internalizes common log item creation.
+func (l *RPCLogger) send(item LogItem) {
+	item.Timestamp = time.Now().UnixNano()
+	item.Service = l.serviceName
 
 	select {
 	case l.queue <- item:
 		// Queued in memory successfully
 	default:
-		// Queue is full. Do not drop the log, persist it locally.
 		l.persistLocally(item, "queue_full")
 	}
 }
@@ -92,7 +99,6 @@ func (l *RPCLogger) SendAsync(level, message string) {
 // processQueue handles transmitting logs via RPC.
 func (l *RPCLogger) processQueue() {
 	defer l.wg.Done()
-
 	for {
 		select {
 		case <-l.ctx.Done():
@@ -107,7 +113,7 @@ func (l *RPCLogger) processQueue() {
 	}
 }
 
-// dispatchRPC attempts to send the log over the mesh. If it fails, it saves to the WAL.
+// dispatchRPC attempts to send the log over the mesh.
 func (l *RPCLogger) dispatchRPC(item LogItem) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
@@ -122,27 +128,23 @@ func (l *RPCLogger) dispatchRPC(item LogItem) {
 func (l *RPCLogger) persistLocally(item LogItem, reason string) {
 	data, err := json.Marshal(item)
 	if err != nil {
-		fmt.Printf("CRITICAL: Failed to marshal log for WAL: %v\n", err)
+		fmt.Printf("CRITICAL: Failed to marshal log: %v\n", err)
 		return
 	}
 
-	// Persist to local WAL using the engine signature:
-	// Append(txnID uint64, expiresAt int64, id PageID, key, value []byte)
 	txnID := uint64(0)
-	expiresAt := time.Now().Add(24 * time.Hour).UnixNano()
+	expiresAt := time.Now().Add(24 * 7 * time.Hour).UnixNano() // Audit logs kept longer
 	pageID := ultimate_db.PageID(999)
-	key := []byte(fmt.Sprintf("offline_log:%d", item.Timestamp))
+	key := []byte(fmt.Sprintf("log:%d", item.Timestamp))
 
 	err = l.localWAL.Append(txnID, expiresAt, pageID, key, data)
 	if err != nil {
 		fmt.Printf("CRITICAL: Failed to append to local WAL: %v\n", err)
 		return
 	}
-	
-	fmt.Printf("[LOGGER OFFLINE] Log saved to local WAL due to: %s\n", reason)
 }
 
-// flush empties the queue safely during application shutdown.
+// flush empties the queue safely during shutdown.
 func (l *RPCLogger) flush() {
 	close(l.queue)
 	for item := range l.queue {
