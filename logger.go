@@ -9,7 +9,7 @@ import (
 
         "github.com/gddisney/ultimate_db"
 )
-
+type RPCLogger = LogDispatcher
 type LogItem struct {
         Timestamp int64  `json:"timestamp"`
         Level     string `json:"level"`
