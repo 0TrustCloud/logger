@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"strings"
 	"sync"
 	"time"
@@ -67,6 +68,15 @@ func (ld *LogDispatcher) send(item LogItem) {
 	item.Timestamp = time.Now().UnixNano()
 	item.Service = ld.serviceName
 
+	// TERMINAL OUTPUT: Print logs immediately as they land
+	if item.Level == "AUDIT" {
+		log.Printf("[%s] %s | Actor: %s | Action: %s | %s", item.Level, item.Service, item.Actor, item.Action, item.Message)
+	} else if item.Action != "" {
+		log.Printf("[%s] %s | Action: %s | %s", item.Level, item.Service, item.Action, item.Message)
+	} else {
+		log.Printf("[%s] %s | %s", item.Level, item.Service, item.Message)
+	}
+
 	ld.persistToDB(item)
 
 	select {
@@ -107,7 +117,7 @@ func (ld *LogDispatcher) dispatch(item LogItem) {
 	}
 }
 
-// FIX: Standardized level strings using strings.ToUpper to make the invocation casing-agnostic
+// Standardized level strings using strings.ToUpper to make the invocation casing-agnostic
 func (ld *LogDispatcher) Log(level, component, msg string) {
 	ld.send(LogItem{
 		Level:   strings.ToUpper(strings.TrimSpace(level)),
