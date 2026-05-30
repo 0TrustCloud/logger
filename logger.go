@@ -4,17 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
-	"strings"
 	"sync"
 	"time"
 
 	"github.com/0TrustCloud/ultimate_db"
 )
 
-type RPCLogger = LogDispatcher
-
-// LogItem represents a standardized zero-trust telemetry frame.
+// LogItem represents a structured log entry.
 type LogItem struct {
 	Timestamp int64  `json:"timestamp"`
 	Level     string `json:"level"`
@@ -24,15 +20,16 @@ type LogItem struct {
 	Action    string `json:"action,omitempty"`
 }
 
+// Exporter defines the interface for custom log targets (SIEM, RPC, etc.)
 type Exporter interface {
 	Export(item LogItem) error
 }
 
+// LogDispatcher manages the async pipeline and exporter registry.
 type LogDispatcher struct {
 	exporters   []Exporter
 	exportersMu sync.RWMutex
-	db          *ultimate_db.DB
-	logPage     ultimate_db.PageID
+	localWAL    *ultimate_db.BatchingWAL
 	serviceName string
 	queue       chan LogItem
 	wg          sync.WaitGroup
@@ -40,14 +37,19 @@ type LogDispatcher struct {
 	cancel      context.CancelFunc
 }
 
-// NewLogDispatcher configures an asynchronous, zero-copy structural logging subsystem.
-func NewLogDispatcher(serviceName string, db *ultimate_db.DB, logPage ultimate_db.PageID, bufferSize int) (*LogDispatcher, error) {
+// NewLogDispatcher initializes the pub/sub logging system.
+func NewLogDispatcher(serviceName string, bufferSize int, walPath string) (*LogDispatcher, error) {
 	ctx, cancel := context.WithCancel(context.Background())
+
+	wal, err := ultimate_db.NewBatchingWAL(walPath)
+	if err != nil {
+		cancel()
+		return nil, fmt.Errorf("failed to init WAL: %w", err)
+	}
 
 	ld := &LogDispatcher{
 		exporters:   []Exporter{},
-		db:          db,
-		logPage:     logPage,
+		localWAL:    wal,
 		serviceName: serviceName,
 		queue:       make(chan LogItem, bufferSize),
 		ctx:         ctx,
@@ -60,129 +62,90 @@ func NewLogDispatcher(serviceName string, db *ultimate_db.DB, logPage ultimate_d
 	return ld, nil
 }
 
+// RegisterExporter adds a new destination (e.g., SIEM, RPC) to the dispatcher.
 func (ld *LogDispatcher) RegisterExporter(e Exporter) {
 	ld.exportersMu.Lock()
 	defer ld.exportersMu.Unlock()
 	ld.exporters = append(ld.exporters, e)
 }
 
-// send processes formatting rules instantly and pushes the element to the lock-free queue channel
+// --- Standard Logging Interface ---
+
+func (ld *LogDispatcher) Info(message string)  { ld.send(LogItem{Level: "INFO", Message: message}) }
+func (ld *LogDispatcher) Error(message string) { ld.send(LogItem{Level: "ERROR", Message: message}) }
+func (ld *LogDispatcher) Debug(message string) { ld.send(LogItem{Level: "DEBUG", Message: message}) }
+func (ld *LogDispatcher) Audit(actor, action, message string) {
+	ld.send(LogItem{Level: "AUDIT", Actor: actor, Action: action, Message: message})
+}
+
+// send adds an item to the queue.
 func (ld *LogDispatcher) send(item LogItem) {
 	item.Timestamp = time.Now().UnixNano()
 	item.Service = ld.serviceName
 
-	// TERMINAL STDOUT: Print logs instantly using fast conditional strings
-	if item.Level == "AUDIT" {
-		log.Printf("[%s] %s | Actor: %s | Action: %s | %s", item.Level, item.Service, item.Actor, item.Action, item.Message)
-	} else if item.Action != "" {
-		log.Printf("[%s] %s | Action: %s | %s", item.Level, item.Service, item.Action, item.Message)
-	} else {
-		log.Printf("[%s] %s | %s", item.Level, item.Service, item.Message)
-	}
-
-	// Dynamic Channel Guard: Prevents caller blocking during high-velocity threat ingestion bursts.
-	// In production, we log a warning on stdout if the internal database pipeline is experiencing backpressure.
 	select {
 	case ld.queue <- item:
 	default:
-		log.Printf("[WARNING] Telemetry queue saturation. Log frame dropped to safeguard core plane uptime.")
+		ld.persistLocally(item, "queue_full")
 	}
 }
 
-// processQueue acts as a single-threaded batching manager, pulling elements 
-// asynchronously and committing them to the durable slot storage blocks.
+// processQueue handles the pub/sub distribution.
 func (ld *LogDispatcher) processQueue() {
 	defer ld.wg.Done()
-
-	const maxBatchSize = 128
-	const batchTimeout = 10 * time.Millisecond
-
-	batch := make([]LogItem, 0, maxBatchSize)
-	ticker := time.NewTicker(batchTimeout)
-	defer ticker.Stop()
-
-	flushBatch := func() {
-		if len(batch) == 0 {
-			return
-		}
-
-		// Group-Commit Optimization: Enclose the entire batch inside a single transaction context
-		txn := ld.db.BeginTxn()
-		for _, item := range batch {
-			data, err := json.Marshal(item)
-			if err != nil {
-				continue
-			}
-			key := []byte(fmt.Sprintf("log:%d", item.Timestamp))
-			_ = ld.db.Write(ld.logPage, txn, key, data, 0)
-		}
-		ld.db.CommitTxn(txn)
-
-		// Dispatch to secondary monitoring exports asynchronously
-		for _, item := range batch {
-			ld.dispatch(item)
-		}
-		batch = batch[:0]
-	}
-
 	for {
 		select {
 		case <-ld.ctx.Done():
-			// Drain remaining buffer contents before executing termination sequences
-			for {
-				select {
-				case item := <-ld.queue:
-					batch = append(batch, item)
-					if len(batch) >= maxBatchSize {
-						flushBatch()
-					}
-				default:
-					flushBatch()
-					return
-				}
-			}
-
+			ld.flush()
+			return
 		case item, ok := <-ld.queue:
 			if !ok {
-				flushBatch()
 				return
 			}
-			batch = append(batch, item)
-			if len(batch) >= maxBatchSize {
-				flushBatch()
-			}
-
-		case <-ticker.C:
-			flushBatch()
+			ld.dispatch(item)
 		}
 	}
 }
 
+// dispatch sends the item to all registered exporters.
 func (ld *LogDispatcher) dispatch(item LogItem) {
 	ld.exportersMu.RLock()
 	defer ld.exportersMu.RUnlock()
+
 	for _, exp := range ld.exporters {
-		_ = exp.Export(item)
+		if err := exp.Export(item); err != nil {
+			ld.persistLocally(item, fmt.Sprintf("exporter_error: %v", err))
+		}
 	}
 }
 
-func (ld *LogDispatcher) Log(level, component, msg string) {
-	ld.send(LogItem{
-		Level:   strings.ToUpper(strings.TrimSpace(level)),
-		Action:  component,
-		Message: msg,
-	})
+// persistLocally provides a fallback for failed exports or full queues.
+func (ld *LogDispatcher) persistLocally(item LogItem, reason string) {
+	data, _ := json.Marshal(item)
+	key := []byte(fmt.Sprintf("log:%d:%s", item.Timestamp, reason))
+	
+	// FIXED: Satisfies signature requirements: (uint64, uint8, ultimate_db.PageID, []byte, []byte, []byte)
+	// Passing txID=0 (non-transactional system append), reqType=1 (standard system write index), 
+	// pageID=999 (isolated logger tracking frame block), and empty schema descriptor bytes block.
+	_, _ = ld.localWAL.Append(
+		uint64(0), 
+		uint8(1), 
+		ultimate_db.PageID(999), 
+		key, 
+		data, 
+		nil,
+	)
 }
 
-func (ld *LogDispatcher) Info(msg string)  { ld.send(LogItem{Level: "INFO", Message: msg}) }
-func (ld *LogDispatcher) Error(msg string) { ld.send(LogItem{Level: "ERROR", Message: msg}) }
-func (ld *LogDispatcher) Debug(msg string) { ld.send(LogItem{Level: "DEBUG", Message: msg}) }
-func (ld *LogDispatcher) Audit(actor, action, msg string) {
-	ld.send(LogItem{Level: "AUDIT", Actor: actor, Action: action, Message: msg})
+func (ld *LogDispatcher) flush() {
+	close(ld.queue)
+	for item := range ld.queue {
+		ld.persistLocally(item, "shutdown_flush")
+	}
 }
 
-// Close gracefully stops the worker thread and forces all trailing records to disk
 func (ld *LogDispatcher) Close() {
 	ld.cancel()
 	ld.wg.Wait()
+	_ = ld.localWAL.Close()
 }

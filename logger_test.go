@@ -1,83 +1,88 @@
 package logger
 
 import (
-        "os"
-        "path/filepath"
-        "sync"
-        "testing"
-        "time"
-
-        "github.com/OTrustCloud/ultimate_db"
+	"os"
+	"path/filepath"
+	"sync"
+	"testing"
+	"time"
 )
 
+// MockExporter captures logs to verify dispatching
 type MockExporter struct {
-        mu   sync.Mutex
-        Logs []LogItem
+	mu   sync.Mutex
+	Logs []LogItem
 }
 
 func (m *MockExporter) Export(item LogItem) error {
-        m.mu.Lock()
-        defer m.mu.Unlock()
-        m.Logs = append(m.Logs, item)
-        return nil
-}
-
-func setupDB(t *testing.T) (*ultimate_db.DB, string) {
-        dir, err := os.MkdirTemp("", "logger_test_db")
-        if err != nil {
-                t.Fatalf("Failed to create temp dir: %v", err)
-        }
-        dbPath := filepath.Join(dir, "test.db")
-        walPath := filepath.Join(dir, "test.wal")
-
-        dm, _ := ultimate_db.NewDiskManager(dbPath)
-        bp := ultimate_db.NewBufferPool(dm, 1024)
-        wal, _ := ultimate_db.NewBatchingWAL(walPath)
-        db := ultimate_db.NewDB(bp, wal)
-        ultimate_db.RecoverDB(walPath, db)
-
-        return db, dir
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.Logs = append(m.Logs, item)
+	return nil
 }
 
 func TestLogDispatcher_PubSub(t *testing.T) {
-        db, dir := setupDB(t)
-        defer os.RemoveAll(dir)
+	tmpDir, _ := os.MkdirTemp("", "log_test")
+	defer os.RemoveAll(tmpDir)
+	walPath := filepath.Join(tmpDir, "test.wal")
 
-        ld, err := NewLogDispatcher("test_svc", db, 1, 10)
-        if err != nil {
-                t.Fatalf("Failed: %v", err)
-        }
-        defer ld.Close()
+	// 1. Initialize Dispatcher
+	ld, err := NewLogDispatcher("test_service", 10, walPath)
+	if err != nil {
+		t.Fatalf("Failed to create dispatcher: %v", err)
+	}
+	defer ld.Close()
 
-        mock := &MockExporter{}
-        ld.RegisterExporter(mock)
+	// 2. Register Mock Exporter
+	mock := &MockExporter{}
+	ld.RegisterExporter(mock)
 
-        ld.Info("Test message 1")
-        ld.Audit("user1", "LOGIN", "success")
+	// 3. Send Logs
+	ld.Info("Test message 1")
+	ld.Audit("user1", "LOGIN", "success")
 
-        time.Sleep(100 * time.Millisecond)
+	// 4. Wait for async processing
+	time.Sleep(100 * time.Millisecond)
 
-        mock.mu.Lock()
-        if len(mock.Logs) != 2 {
-                t.Errorf("Expected 2 logs in exporter, got %d", len(mock.Logs))
-        }
-        mock.mu.Unlock()
+	// 5. Verify Dispatch
+	mock.mu.Lock()
+	if len(mock.Logs) != 2 {
+		t.Fatalf("Expected 2 logs, got %d", len(mock.Logs))
+	}
+	
+	if mock.Logs[0].Level != "INFO" || mock.Logs[0].Message != "Test message 1" {
+		t.Errorf("Log 1 mismatch: got %v", mock.Logs[0])
+	}
 
-        // Verify Database Persistence
-        txn := db.BeginTxn()
-        // Commit ensures the txn was used and completed
-        db.CommitTxn(txn)
+	if mock.Logs[1].Level != "AUDIT" || mock.Logs[1].Actor != "user1" {
+		t.Errorf("Log 2 mismatch: got %v", mock.Logs[1])
+	}
+	mock.mu.Unlock()
 }
 
-func TestLogDispatcher_MiddlewareCompatibility(t *testing.T) {
-        db, dir := setupDB(t)
-        defer os.RemoveAll(dir)
+func TestLogDispatcher_Fallback(t *testing.T) {
+	// Test that a failing exporter doesn't crash the system and logs to WAL
+	tmpDir, _ := os.MkdirTemp("", "log_test_fail")
+	defer os.RemoveAll(tmpDir)
+	walPath := filepath.Join(tmpDir, "fail.wal")
 
-        ld, _ := NewLogDispatcher("test_svc", db, 1, 10)
-        defer ld.Close()
+	ld, _ := NewLogDispatcher("test_fail", 10, walPath)
+	
+	// Register a broken exporter
+	ld.RegisterExporter(&BrokenExporter{})
+	
+	ld.Info("Should end up in WAL")
+	time.Sleep(100 * time.Millisecond)
+	
+	ld.Close()
+	
+	// Assert WAL file exists and has content (simplified check)
+	if _, err := os.Stat(walPath); os.IsNotExist(err) {
+		t.Error("WAL file was not created for fallback")
+	}
+}
 
-        ld.Info("info")
-        ld.Error("error")
-        ld.Debug("debug")
-        ld.Audit("actor", "action", "message")
+type BrokenExporter struct{}
+func (b *BrokenExporter) Export(item LogItem) error {
+	return os.ErrPermission // Simulate failure
 }

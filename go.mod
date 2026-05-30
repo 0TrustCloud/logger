@@ -1,9 +1,5 @@
-module github.com/OTrustCloud/logger
+module github.com/0TrustCloud/logger
 
-go 1.25.10
+go 1.23.3
 
-require (
-	github.com/0TrustCloud/secure_network v1.1.1
-	github.com/0TrustCloud/ultimate_db v1.0.0
-)
-
+require github.com/0TrustCloud/ultimate_db v1.2.1
