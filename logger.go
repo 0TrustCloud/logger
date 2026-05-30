@@ -9,7 +9,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/gddisney/ultimate_db"
+	"github.com/0TrustCloud/ultimate_db"
 )
 
 type RPCLogger = LogDispatcher
