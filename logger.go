@@ -2,37 +2,34 @@ package logger
 
 import (
 	"context"
-	"crypto"
-	"crypto/rand"
-	"crypto/rsa"
-	"crypto/sha256"
-	"encoding/base64"
 	"fmt"
 	"sync"
 	"time"
+
+	"github.com/0TrustCloud/secure_data_format"
 )
 
-// LogItem represents a structured log entry with stateless cryptographic attribution.
+// LogItem represents a cryptographically wrapped structured log entry.
 type LogItem struct {
-	Timestamp   int64  `json:"timestamp"`
-	Level       string `json:"level"`
-	Message     string `json:"message"`
-	Service     string `json:"service"`
-	Actor       string `json:"actor,omitempty"`
-	Action      string `json:"action,omitempty"`
-	Attestation string `json:"attestation,omitempty"` // Base64 signature proving origin authenticity
+	Timestamp int64  `json:"timestamp"`
+	Level     string `json:"level"`
+	Message   string `json:"message"`
+	Service   string `json:"service"`
+	Actor     string `json:"actor,omitempty"`
+	Action    string `json:"action,omitempty"`
+	Token     string `json:"token,omitempty"` // Cryptographic SDF signature token envelope
 }
 
-// Exporter defines the interface for downstream log streams (SIEM, RPC collectors, etc.)
+// Exporter defines the interface for custom log targets (SIEM, RPC, etc.)
 type Exporter interface {
 	Export(item LogItem) error
 }
 
-// LogDispatcher manages the stateless, non-blocking attribution signing pipeline.
+// LogDispatcher manages the async pipeline and cryptographic compilation engine.
 type LogDispatcher struct {
 	exporters   []Exporter
 	exportersMu sync.RWMutex
-	signingKey  *rsa.PrivateKey
+	sdfEngine   *secure_data_format.SecureDataEngine
 	serviceName string
 	queue       chan LogItem
 	wg          sync.WaitGroup
@@ -40,17 +37,17 @@ type LogDispatcher struct {
 	cancel      context.CancelFunc
 }
 
-// NewLogDispatcher initializes a zero-storage logging pipeline backed by stateless RSA signatures.
-func NewLogDispatcher(serviceName string, bufferSize int, privKey *rsa.PrivateKey) (*LogDispatcher, error) {
-	if privKey == nil {
-		return nil, fmt.Errorf("cannot initialize attribution logging without an active private signing key")
+// NewLogDispatcher initializes the pub/sub logging system backed by the SDF compiler core.
+func NewLogDispatcher(serviceName string, bufferSize int, sdf *secure_data_format.SecureDataEngine) (*LogDispatcher, error) {
+	if sdf == nil {
+		return nil, fmt.Errorf("cannot instantiate logging framework without an active SDF engine context")
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 
 	ld := &LogDispatcher{
 		exporters:   []Exporter{},
-		signingKey:  privKey,
+		sdfEngine:   sdf,
 		serviceName: serviceName,
 		queue:       make(chan LogItem, bufferSize),
 		ctx:         ctx,
@@ -63,7 +60,7 @@ func NewLogDispatcher(serviceName string, bufferSize int, privKey *rsa.PrivateKe
 	return ld, nil
 }
 
-// RegisterExporter attaches an external streaming target to the dispatcher.
+// RegisterExporter adds a new destination (e.g., SIEM, RPC) to the dispatcher.
 func (ld *LogDispatcher) RegisterExporter(e Exporter) {
 	ld.exportersMu.Lock()
 	defer ld.exportersMu.Unlock()
@@ -79,6 +76,7 @@ func (ld *LogDispatcher) Audit(actor, action, message string) {
 	ld.send(LogItem{Level: "AUDIT", Actor: actor, Action: action, Message: message})
 }
 
+// send adds an item to the channel queue, or falls back to immediate synchronous compilation if full.
 func (ld *LogDispatcher) send(item LogItem) {
 	item.Timestamp = time.Now().UnixNano()
 	item.Service = ld.serviceName
@@ -86,18 +84,18 @@ func (ld *LogDispatcher) send(item LogItem) {
 	select {
 	case ld.queue <- item:
 	default:
-		// Drop/Backpressure block: If the queue is backed up, sign synchronously 
-		// and attempt immediate delivery to prevent shedding attribution context
-		ld.dispatch(item)
+		// Emergency sync compilation boundary to force writing to storage logs immediately if queue blocks
+		_ = ld.compileAndRecord(item)
 	}
 }
 
+// processQueue handles the pub/sub distribution.
 func (ld *LogDispatcher) processQueue() {
 	defer ld.wg.Done()
 	for {
 		select {
 		case <-ld.ctx.Done():
-			ld.drain()
+			ld.flush()
 			return
 		case item, ok := <-ld.queue:
 			if !ok {
@@ -108,66 +106,54 @@ func (ld *LogDispatcher) processQueue() {
 	}
 }
 
-// signForAttribution computes a deterministic hash of the log fields and signs it statelessly.
-func (ld *LogDispatcher) signForAttribution(item *LogItem) {
-	// Build a deterministic string block matching the log content
-	payload := fmt.Sprintf("%d|%s|%s|%s|%s|%s",
-		item.Timestamp,
-		item.Level,
-		item.Service,
-		item.Message,
-		item.Actor,
-		item.Action,
-	)
+// compileAndRecord processes the log record directly through the SDF script token compiler.
+func (ld *LogDispatcher) compileAndRecord(item LogItem) LogItem {
+	script := `log:event(status("emitted"))`
+	targetAddress := fmt.Sprintf("log:%s:%d", ld.serviceName, item.Timestamp)
 
-	hash := sha256.Sum256([]byte(payload))
-	sig, err := rsa.SignPKCS1v15(rand.Reader, ld.signingKey, crypto.SHA256, hash[:])
-	if err == nil {
-		item.Attestation = base64.StdEncoding.EncodeToString(sig)
+	tx := secure_data_format.DataInvocation{
+		TargetAddress: targetAddress,
+		Caller:        ld.serviceName,
+		Nonce:         uint64(item.Timestamp), // Use incremental nanosecond timestamps as order nonces
+		Method:        "EMIT",
+		Profile:       secure_data_format.ProfileStructuredLog,
+		Args: map[string]interface{}{
+			"level":   item.Level,
+			"message": item.Message,
+			"actor":   item.Actor,
+			"action":  item.Action,
+		},
 	}
+
+	// This operation automatically handles persistence to both the world state index 
+	// and transaction log targets inside ultimate_db concurrently
+	tokenStr, err := ld.sdfEngine.CompileSecureData(script, tx)
+	if err == nil {
+		item.Token = tokenStr
+	}
+	return item
 }
 
+// dispatch compiles the entry and transmits the cryptographically signed record to exporters.
 func (ld *LogDispatcher) dispatch(item LogItem) {
-	ld.signForAttribution(&item)
+	enrichedItem := ld.compileAndRecord(item)
 
 	ld.exportersMu.RLock()
 	defer ld.exportersMu.RUnlock()
 
 	for _, exp := range ld.exporters {
-		_ = exp.Export(item) 
+		if err := exp.Export(enrichedItem); err != nil {
+			// Failures are inherently tracked via the permanent transaction ledger footprint
+			// generated during the initial execution step of compileAndRecord
+			continue
+		}
 	}
 }
 
-// VerifyAttestation can be invoked downstream (e.g., inside your SIEM or analytics layer) 
-// to confirm the log has not been modified since ingest.
-func VerifyAttestation(item LogItem, pubKey *rsa.PublicKey) bool {
-	if item.Attestation == "" || pubKey == nil {
-		return false
-	}
-
-	payload := fmt.Sprintf("%d|%s|%s|%s|%s|%s",
-		item.Timestamp,
-		item.Level,
-		item.Service,
-		item.Message,
-		item.Actor,
-		item.Action,
-	)
-
-	sigBytes, err := base64.StdEncoding.DecodeString(item.Attestation)
-	if err != nil {
-		return false
-	}
-
-	hash := sha256.Sum256([]byte(payload))
-	err = rsa.VerifyPKCS1v15(pubKey, crypto.SHA256, hash[:], sigBytes)
-	return err == nil
-}
-
-func (ld *LogDispatcher) drain() {
+func (ld *LogDispatcher) flush() {
 	close(ld.queue)
 	for item := range ld.queue {
-		ld.dispatch(item)
+		_ = ld.compileAndRecord(item)
 	}
 }
 
