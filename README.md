@@ -1,7 +1,7 @@
 
 # Cryptographic Logging Dispatcher (`logger`)
 
-The `logger` package provides a high-throughput, tamper-evident structured logging framework designed for zero-trust systems. It completely replaces standard, volatile out-of-band file writing or traditional page-bound Write-Ahead Logging (WAL) engines with verifiable cryptographic state contracts managed by the **Secure Data Format (SDF)** protocol engine.
+The `logger` package provides a high-throughput, tamper-evident structured logging framework designed for zero-trust systems to have verifiable cryptographic state contracts managed by the **Secure Data Format (SDF)** protocol engine.
 
 Every emitted log statement, debugging event, or system audit record compiles directly into an immutable transaction receipt. Once a log entry is signed and sealed, its existence and contents are cryptographically provable and structurally impossible to retroactively alter or erase.
 
